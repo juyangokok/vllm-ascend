@@ -97,8 +97,11 @@ def reference_ids(query, weights, backing, lengths, table, cu, *, regions, top_k
 
 
 def check_case(query_lengths, regions, page_size, top_k, lengths, *, groups, heads, dtype, ties=False, ids=None):
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+    device_type = get_ascend_device_type()
+    if device_type == AscendDeviceType.A3 and dtype != torch.bfloat16:
+        pytest.skip("A3 IndexerRegionScore requires BF16 query and key")
+    if device_type not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     enable_custom_op()
     query, weights, backing, lengths, table, cu = make_inputs(
         query_lengths, regions, page_size, lengths, groups=groups, heads=heads, dtype=dtype, ties=ties
@@ -191,8 +194,8 @@ def test_output_written_through_strided_view():
     """selected_region_ids may be a non-contiguous view: the operator must
     write through its strides and never touch neighbouring elements
     (SENTINEL guards before, after, and in the interleaved gaps)."""
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+    if get_ascend_device_type() not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     groups, tokens, top_k = 4, 3, 7
     storage = torch.full((groups * tokens * top_k * 2 + 2 * GUARD_ELEMENTS,), SENTINEL, dtype=torch.int32, device="npu")
     ids = storage[GUARD_ELEMENTS:-GUARD_ELEMENTS:2].view(groups, tokens, top_k)
@@ -207,8 +210,8 @@ def test_output_written_through_strided_view():
 def test_schema_declares_write_alias_output():
     """The ids_out overload returns nothing: selected_region_ids is the
     kwarg-only write-alias output argument of the schema."""
-    if get_ascend_device_type() != AscendDeviceType.A5:
-        pytest.skip("IndexerRegionScore requires Ascend 950 (A5)")
+    if get_ascend_device_type() not in (AscendDeviceType.A3, AscendDeviceType.A5):
+        pytest.skip("IndexerRegionScore requires A3 or A5")
     enable_custom_op()
     schema = torch.ops._C_ascend.npu_indexer_region_score.ids_out._schema
     assert not schema.returns
@@ -216,3 +219,12 @@ def test_schema_declares_write_alias_output():
     assert output.name == "selected_region_ids"
     assert output.kwarg_only and not output.has_default_value()
     assert output.alias_info.is_write
+
+
+@pytest.mark.parametrize("groups,heads,regions,page_size", [(8, 20, 129, 17), (12, 124, 9, 3)])
+def test_bf16_non_aligned_head_counts(groups, heads, regions, page_size):
+    """Exercise BF16 Cube M padding and region tile tails on A3 and A5."""
+    check_case(
+        (2,), regions, page_size, min(regions, 17), (regions * REGION_SIZE + 2,),
+        groups=groups, heads=heads, dtype=torch.bfloat16,
+    )
